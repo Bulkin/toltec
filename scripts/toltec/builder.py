@@ -18,7 +18,6 @@ import re
 import os
 import logging
 import textwrap
-import docker
 import requests
 from . import bash, util, ipk, paths
 from .recipe import Recipe, Package
@@ -63,13 +62,15 @@ class Builder:  # pylint: disable=too-few-public-methods
     # Toltec Docker image used for generic tasks
     DEFAULT_IMAGE = "toolchain:v1.3.1"
 
-    def __init__(self, work_dir: str, repo_dir: str) -> None:
+    def __init__(self, work_dir: str, repo_dir: str, build_locally: bool) -> None:
         """
         Create a builder helper.
 
         :param work_dir: directory where packages are built
         :param repo_dir: directory where built packages are stored
         """
+        self.build_locally = build_locally
+        
         self.work_dir = work_dir
         os.makedirs(work_dir, exist_ok=True)
 
@@ -88,7 +89,10 @@ class Builder:  # pylint: disable=too-few-public-methods
         self.adapter = BuildContextAdapter(logger, self.context)
 
         try:
+            import docker
             self.docker = docker.from_env()
+        except ModuleNotFoundError:
+            print("Docker module not found, only local builds supported")
         except docker.errors.DockerException as err:
             raise BuildError(
                 "Unable to connect to the Docker daemon. \
@@ -97,7 +101,8 @@ permissions."
             ) from err
 
     def make(
-        self, recipe: Recipe, packages: Optional[Iterable[Package]] = None
+        self, recipe: Recipe, 
+        packages: Optional[Iterable[Package]] = None,
     ) -> bool:
         """
         Build a recipe and create its associated packages.
@@ -110,24 +115,29 @@ permissions."
         self.context["recipe"] = recipe.name
         build_dir = os.path.join(self.work_dir, recipe.name)
 
-        if not util.check_directory(
-            build_dir,
-            f"The build directory '{os.path.relpath(build_dir)}' for recipe \
+        if self.build_locally:
+            src_dir = self.work_dir
+        else:
+            if not util.check_directory(
+                    build_dir,
+                    f"The build directory '{os.path.relpath(build_dir)}' for recipe \
 '{recipe.name}' already exists.\nWould you like to [c]ancel, [r]emove \
 that directory, or [k]eep it (not recommended)?",
-        ):
-            return False
+            ):
+                return False
 
-        src_dir = os.path.join(build_dir, "src")
-        os.makedirs(src_dir, exist_ok=True)
+            src_dir = os.path.join(build_dir, "src")
+            os.makedirs(src_dir, exist_ok=True)
 
         base_pkg_dir = os.path.join(build_dir, "pkg")
         os.makedirs(base_pkg_dir, exist_ok=True)
 
-        self._fetch_source(recipe, src_dir)
+        if not self.build_locally:
+            self._fetch_source(recipe, src_dir)
         self._prepare(recipe, src_dir)
         self._build(recipe, src_dir)
-        self._strip(recipe, src_dir)
+        if not self.build_locally:
+            self._strip(recipe, src_dir)
 
         for package in (
             packages if packages is not None else recipe.packages.values()
@@ -137,6 +147,7 @@ that directory, or [k]eep it (not recommended)?",
             pkg_dir = os.path.join(base_pkg_dir, package.name)
             os.makedirs(pkg_dir, exist_ok=True)
 
+            print(src_dir, pkg_dir)
             self._package(package, src_dir, pkg_dir)
             self._archive(package, pkg_dir)
             del self.context["package"]
@@ -261,36 +272,44 @@ source file '{source.url}', got {req.status_code}"
                     " -- " + " ".join(host_deps),
                 )
             )
-
-        logs = bash.run_script_in_container(
-            self.docker,
-            image=self.IMAGE_PREFIX + recipe.image,
-            mounts=[
-                docker.types.Mount(
-                    type="bind",
-                    source=os.path.abspath(src_dir),
-                    target=mount_src,
+            
+        if self.build_locally:
+            logs = bash.run_script(variables={ **recipe.variables,
+                                               **recipe.custom_variables,
+                                               "srcdir": self.work_dir,
+                                              },
+                                   script=script,
+                                   cwd=self.work_dir)
+        else:
+            logs = bash.run_script_in_container(
+                self.docker,
+                image=self.IMAGE_PREFIX + recipe.image,
+                mounts=[
+                    docker.types.Mount(
+                        type="bind",
+                        source=os.path.abspath(src_dir),
+                        target=mount_src,
+                    ),
+                    docker.types.Mount(
+                        type="bind",
+                        source=os.path.abspath(self.repo_dir),
+                        target=repo_src,
+                    ),
+                ],
+                variables={
+                    **recipe.variables,
+                    **recipe.custom_variables,
+                    "srcdir": mount_src,
+                },
+                script="\n".join(
+                    (
+                        *pre_script,
+                        f'cd "{mount_src}"',
+                        script,
+                        f'chown -R {uid}:{uid} "{mount_src}"',
+                    )
                 ),
-                docker.types.Mount(
-                    type="bind",
-                    source=os.path.abspath(self.repo_dir),
-                    target=repo_src,
-                ),
-            ],
-            variables={
-                **recipe.variables,
-                **recipe.custom_variables,
-                "srcdir": mount_src,
-            },
-            script="\n".join(
-                (
-                    *pre_script,
-                    f'cd "{mount_src}"',
-                    script,
-                    f'chown -R {uid}:{uid} "{mount_src}"',
-                )
-            ),
-        )
+            )
 
         self._print_logs(logs, "build()")
 
@@ -339,6 +358,7 @@ source file '{source.url}', got {req.status_code}"
                 "srcdir": src_dir,
                 "pkgdir": pkg_dir,
             },
+            cwd=src_dir
         )
 
         self._print_logs(logs, "package()")
@@ -355,7 +375,10 @@ source file '{source.url}', got {req.status_code}"
     def _archive(self, package: Package, pkg_dir: str) -> None:
         """Create an archive for a package."""
         self.adapter.info("Creating archive")
-        ar_path = os.path.join(paths.REPO_DIR, package.filename())
+        if self.build_locally:
+            ar_path = os.path.join(pkg_dir, package.filename())
+        else:
+            ar_path = os.path.join(paths.REPO_DIR, package.filename())
 
         # Inject Oxide-specific hook for reloading apps
         if os.path.exists(os.path.join(pkg_dir, "opt/usr/share/applications")):

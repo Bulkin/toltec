@@ -5,7 +5,10 @@
 import shlex
 import subprocess
 from typing import Dict, Generator, List, Optional, Tuple, Union
-from docker.client import DockerClient
+try:
+    from docker.client import DockerClient
+except ModuleNotFoundError:
+    print("Couldn't load the docker module")
 
 AssociativeArray = Dict[str, str]
 IndexedArray = List[Optional[str]]
@@ -322,7 +325,7 @@ def _parse_func(lexer: shlex.shlex) -> Tuple[int, int]:
     return start_byte, end_byte
 
 
-def run_script(variables: Variables, script: str) -> LogGenerator:
+def run_script(variables: Variables, script: str, cwd: str) -> LogGenerator:
     """
     Run a Bash script and stream its output.
 
@@ -336,6 +339,7 @@ def run_script(variables: Variables, script: str) -> LogGenerator:
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
+        cwd=cwd
     )
 
     assert process.stdin is not None
@@ -364,7 +368,7 @@ def run_script(variables: Variables, script: str) -> LogGenerator:
 
 
 def run_script_in_container(
-    docker: DockerClient,
+    docker: Any,
     image: str,
     mounts: List,
     variables: Variables,
